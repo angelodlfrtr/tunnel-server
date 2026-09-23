@@ -32,13 +32,13 @@ const (
 	asnFixture     = "../third_party/maxmind/test-data/GeoLite2-ASN-Test.mmdb"
 )
 
-func provisionApp(t *testing.T, cfg *IPInfoConfig) *OutlineApp {
+func provisionApp(t *testing.T, pool *caddy.UsagePool, cfg *IPInfoConfig) *OutlineApp {
 	t.Helper()
 
 	ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
 	t.Cleanup(cancel)
 
-	app := &OutlineApp{IPInfo: cfg}
+	app := &OutlineApp{IPInfoConfig: cfg, ipInfoPool: pool}
 
 	require.NoError(t, app.Provision(ctx))
 
@@ -48,7 +48,10 @@ func provisionApp(t *testing.T, cfg *IPInfoConfig) *OutlineApp {
 }
 
 func TestIPInfoDisabledByDefault(t *testing.T) {
-	app := provisionApp(t, nil)
+	t.Parallel()
+
+	pool := caddy.NewUsagePool()
+	app := provisionApp(t, pool, nil)
 
 	assert.Nil(t, app.ipInfo)
 	assert.Nil(t, app.ipInfoKey)
@@ -57,7 +60,10 @@ func TestIPInfoDisabledByDefault(t *testing.T) {
 }
 
 func TestIPInfoLookup(t *testing.T) {
-	app := provisionApp(t, &IPInfoConfig{
+	t.Parallel()
+
+	pool := caddy.NewUsagePool()
+	app := provisionApp(t, pool, &IPInfoConfig{
 		CountryDB: countryFixture,
 		ASNDB:     asnFixture,
 	})
@@ -74,11 +80,15 @@ func TestIPInfoLookup(t *testing.T) {
 }
 
 func TestIPInfoSharedAcrossReloads(t *testing.T) {
-	firstApp := provisionApp(t, &IPInfoConfig{
+	t.Parallel()
+
+	pool := caddy.NewUsagePool()
+
+	firstApp := provisionApp(t, pool, &IPInfoConfig{
 		CountryDB: countryFixture,
 		ASNDB:     asnFixture,
 	})
-	secondApp := provisionApp(t, &IPInfoConfig{
+	secondApp := provisionApp(t, pool, &IPInfoConfig{
 		CountryDB: countryFixture,
 		ASNDB:     asnFixture,
 	})
@@ -86,7 +96,7 @@ func TestIPInfoSharedAcrossReloads(t *testing.T) {
 	assert.Equal(t, *firstApp.ipInfoKey, *secondApp.ipInfoKey)
 
 	// 2 references expected.
-	refs, _ := ipInfoPool.References(*firstApp.ipInfoKey)
+	refs, _ := pool.References(*firstApp.ipInfoKey)
 	assert.Equal(t, 2, refs)
 
 	// Cleanup the first app.
@@ -94,40 +104,44 @@ func TestIPInfoSharedAcrossReloads(t *testing.T) {
 	require.NoError(t, firstApp.Cleanup())
 
 	// 1 reference expected, same key (the second app).
-	refs, _ = ipInfoPool.References(*key)
+	refs, _ = pool.References(*key)
 	assert.Equal(t, 1, refs)
 
 	secondAppKey := secondApp.ipInfoKey
 	require.NoError(t, secondApp.Cleanup())
 
-	_, exist := ipInfoPool.References(*secondAppKey)
+	_, exist := pool.References(*secondAppKey)
 	assert.False(t, exist)
 }
 
 func TestIPInfoReopensOnChange(t *testing.T) {
+	t.Parallel()
+
 	tmpDir := t.TempDir()
 	tmpPath := filepath.Join(tmpDir, "ip-country.mmdb")
 	tmpData, err := os.ReadFile(countryFixture)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(tmpPath, tmpData, 0o644))
 
-	firstApp := provisionApp(t, &IPInfoConfig{
+	pool := caddy.NewUsagePool()
+
+	firstApp := provisionApp(t, pool, &IPInfoConfig{
 		CountryDB: tmpPath,
 	})
 
 	after := time.Now().Add(time.Hour)
 	require.NoError(t, os.Chtimes(tmpPath, after, after))
 
-	secondApp := provisionApp(t, &IPInfoConfig{
+	secondApp := provisionApp(t, pool, &IPInfoConfig{
 		CountryDB: tmpPath,
 	})
 
 	assert.NotEqual(t, *firstApp.ipInfoKey, *secondApp.ipInfoKey)
 
-	refs, _ := ipInfoPool.References(*firstApp.ipInfoKey)
+	refs, _ := pool.References(*firstApp.ipInfoKey)
 	assert.Equal(t, 1, refs)
 
-	refs, _ = ipInfoPool.References(*secondApp.ipInfoKey)
+	refs, _ = pool.References(*secondApp.ipInfoKey)
 	assert.Equal(t, 1, refs)
 
 	firstAppKey := firstApp.ipInfoKey
@@ -135,18 +149,21 @@ func TestIPInfoReopensOnChange(t *testing.T) {
 	require.NoError(t, firstApp.Cleanup())
 	require.NoError(t, secondApp.Cleanup())
 
-	_, exist := ipInfoPool.References(*firstAppKey)
+	_, exist := pool.References(*firstAppKey)
 	assert.False(t, exist)
 
-	_, exist = ipInfoPool.References(*secondAppKey)
+	_, exist = pool.References(*secondAppKey)
 	assert.False(t, exist)
 }
 
 func TestIPInfoInvalidConfigNoProvisionError(t *testing.T) {
+	t.Parallel()
+
 	tmpDir := t.TempDir()
 	tmpPath := filepath.Join(tmpDir, "noop.mmdb")
 
-	app := provisionApp(t, &IPInfoConfig{
+	pool := caddy.NewUsagePool()
+	app := provisionApp(t, pool, &IPInfoConfig{
 		CountryDB: tmpPath,
 	})
 
@@ -155,10 +172,13 @@ func TestIPInfoInvalidConfigNoProvisionError(t *testing.T) {
 }
 
 func TestIPInfoPartialConfig(t *testing.T) {
+	t.Parallel()
+
 	tmpDir := t.TempDir()
 	tmpPath := filepath.Join(tmpDir, "noop.mmdb")
 
-	app := provisionApp(t, &IPInfoConfig{
+	pool := caddy.NewUsagePool()
+	app := provisionApp(t, pool, &IPInfoConfig{
 		CountryDB: tmpPath,
 		ASNDB:     asnFixture,
 	})

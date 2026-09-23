@@ -40,19 +40,21 @@ const (
 
 func init() {
 	replayCache := outline.NewReplayCache(0)
+
+	// ipInfoPool uses *caddy.UsagePool (reference counter) to allow
+	// transparent ipinfo sharing across reloads.
+	ipInfoPool := caddy.NewUsagePool()
+
 	caddy.RegisterModule(ModuleRegistration{
 		ID: outlineModuleName,
 		New: func() caddy.Module {
 			app := new(OutlineApp)
 			app.replayCache = &replayCache
+			app.ipInfoPool = ipInfoPool
 			return app
 		},
 	})
 }
-
-// ipInfoPool uses *caddy.UsagePool (reference counter) to allow
-// transparent ipinfo sharing across reloads.
-var ipInfoPool = caddy.NewUsagePool()
 
 // ipInfoKey contains asn / country db paths and last modification time.
 // We can use this key as reference between caddy reloads: if one of the database
@@ -88,15 +90,16 @@ type ShadowsocksConfig struct {
 type OutlineApp struct {
 	ShadowsocksConfig *ShadowsocksConfig `json:"shadowsocks,omitempty"`
 	Handlers          ConnectionHandlers `json:"connection_handlers,omitempty"`
-	IPInfo            *IPInfoConfig      `json:"ipinfo,omitempty"`
+	IPInfoConfig      *IPInfoConfig      `json:"ipinfo,omitempty"`
 
 	logger      *slog.Logger
 	replayCache *outline.ReplayCache
 	metrics     outline.ServiceMetrics
 	buildInfo   *prometheus.GaugeVec
 
-	ipInfo    ipinfo.IPInfoMap
-	ipInfoKey *ipInfoKey
+	ipInfoPool *caddy.UsagePool
+	ipInfo     ipinfo.IPInfoMap
+	ipInfoKey  *ipInfoKey
 }
 
 var (
@@ -147,30 +150,52 @@ func (app *OutlineApp) Provision(ctx caddy.Context) error {
 	return nil
 }
 
+// statDB returns the modification time of a database file, or ok=false if the
+// path is unusable. Unusable databases are logged and skipped, not fatal.
+func (app *OutlineApp) statDB(kind, path string) (int64, bool) {
+	st, err := os.Stat(path)
+	if err == nil && st.IsDir() {
+		err = errors.New("path is a directory, want a file")
+	}
+
+	if err != nil {
+		app.logger.Error(
+			"failed to load IP info database",
+			"database", kind,
+			"path", path,
+			"err", err,
+		)
+		return 0, false
+	}
+
+	return st.ModTime().UnixMicro(), true
+}
+
 func (app *OutlineApp) provisionIPInfo() {
-	if app.IPInfo == nil {
+	if app.IPInfoConfig == nil {
+		return
+	}
+
+	if app.ipInfoPool == nil {
+		app.logger.Error("IP info pool not configured, skipping IP info database")
 		return
 	}
 
 	key := ipInfoKey{}
 
-	// Country db
-	if p := app.IPInfo.CountryDB; len(p) > 0 {
-		if st, err := os.Stat(p); err != nil || st.IsDir() {
-			app.logger.Warn("ignoring ip-country database", "path", p, "err", err)
-		} else {
+	// Country database
+	if p := app.IPInfoConfig.CountryDB; len(p) > 0 {
+		if mod, ok := app.statDB("country", p); ok {
 			key.countryDBPath = p
-			key.countryDBMod = st.ModTime().UnixMicro()
+			key.countryDBMod = mod
 		}
 	}
 
-	// ASN db
-	if p := app.IPInfo.ASNDB; len(p) > 0 {
-		if st, err := os.Stat(p); err != nil || st.IsDir() {
-			app.logger.Warn("ignoring ip-asn database", "path", p, "err", err)
-		} else {
+	// ASN database
+	if p := app.IPInfoConfig.ASNDB; len(p) > 0 {
+		if mod, ok := app.statDB("asn", p); ok {
 			key.asnDBPath = p
-			key.asnDBMod = st.ModTime().UnixMicro()
+			key.asnDBMod = mod
 		}
 	}
 
@@ -178,7 +203,7 @@ func (app *OutlineApp) provisionIPInfo() {
 		return
 	}
 
-	v, _, err := ipInfoPool.LoadOrNew(key, func() (caddy.Destructor, error) {
+	v, _, err := app.ipInfoPool.LoadOrNew(key, func() (caddy.Destructor, error) {
 		m, err := ipinfo.NewMMDBIPInfoMap(key.countryDBPath, key.asnDBPath)
 		if err != nil {
 			return nil, err
@@ -187,7 +212,12 @@ func (app *OutlineApp) provisionIPInfo() {
 		return sharedIPInfo{m}, nil
 	})
 	if err != nil {
-		app.logger.Warn("cannot init ipinfo.IPInfoMap", "err", err)
+		app.logger.Error(
+			"failed to open IP info databases, IP location metrics disabled",
+			"country", key.countryDBPath,
+			"asn", key.asnDBPath,
+			"err", err,
+		)
 		return
 	}
 
@@ -262,7 +292,7 @@ func (app *OutlineApp) Cleanup() error {
 		return nil
 	}
 
-	_, err := ipInfoPool.Delete(*app.ipInfoKey)
+	_, err := app.ipInfoPool.Delete(*app.ipInfoKey)
 	app.ipInfo = nil
 	app.ipInfoKey = nil
 
